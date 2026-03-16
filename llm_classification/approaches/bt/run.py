@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deploy reward approach: train → save → upload dataset → push kernel → poll status.
+Deploy BT approach: train → save → upload dataset → push kernel → poll status.
 
 Usage:
     python run.py [--skip-train] [--message "my message"]
@@ -14,9 +14,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DATASET_DIR = Path(__file__).parent.parent.parent / "kaggle_dataset" / "reward-finetuned"
-KERNEL_ID = "lasseruttert/reward-inference"
-SCRIPT_DIR = Path(__file__).parent
+DATASET_DIR = Path(__file__).parent.parent.parent / "kaggle_dataset" / "bt-finetuned"
+KERNEL_ID   = "lasseruttert/bert-bt-inference"
+SCRIPT_DIR  = Path(__file__).parent
 
 
 def conda(args: list[str], **kwargs) -> subprocess.CompletedProcess:
@@ -37,7 +37,10 @@ def header(msg: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-train", action="store_true")
-    parser.add_argument("--message", default=f"auto deploy reward {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    parser.add_argument(
+        "--message",
+        default=f"auto deploy bt {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    )
     args = parser.parse_args()
 
     if not args.skip_train:
@@ -58,9 +61,9 @@ def main() -> None:
         conda_check(["kaggle", "datasets", "create", "-p", str(DATASET_DIR)])
         new_dataset = True
 
-    if new_dataset:
-        header("Waiting 90s for new dataset to be indexed by Kaggle")
-        time.sleep(90)
+    wait_secs = 90 if new_dataset else 30
+    header(f"Waiting {wait_secs}s for dataset to be processed by Kaggle")
+    time.sleep(wait_secs)
 
     header("Pushing kernel")
     conda_check(["kaggle", "kernels", "push", "-p", str(SCRIPT_DIR)])
@@ -73,7 +76,10 @@ def main() -> None:
         status = result.stdout.strip()
         print(status)
 
-    download_cmd = f"cd '{SCRIPT_DIR}' && conda run -n kaggle kaggle kernels output {KERNEL_ID} -p ./output --force"
+    download_cmd = (
+        f"cd '{SCRIPT_DIR}' && conda run -n kaggle "
+        f"kaggle kernels output {KERNEL_ID} -p ./output --force"
+    )
 
     if re.search(r"complete", status, re.IGNORECASE):
         print("\n=== Done! ===")

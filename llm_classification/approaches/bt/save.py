@@ -1,6 +1,6 @@
 """
-save.py — Copy fold checkpoints + tokenizer/config to kaggle_dataset.
-Run from approaches/basic/ or anywhere; paths are relative to this file.
+save.py — Copy BT fold checkpoints + tokenizer/config to kaggle_dataset.
+Run from approaches/bt/ or anywhere; paths are relative to this file.
 """
 import glob
 import os
@@ -10,13 +10,13 @@ from transformers import RobertaTokenizer, AutoConfig
 HERE        = os.path.dirname(os.path.abspath(__file__))
 ROOT        = os.path.join(HERE, "..", "..")
 CKPT_DIR    = os.path.join(ROOT, "checkpoints")
-DATASET_DIR = os.path.join(ROOT, "kaggle_dataset", "bert-finetuned")
+DATASET_DIR = os.path.join(ROOT, "kaggle_dataset", "bt-finetuned")
 BASE_MODEL  = "roberta-base"
 
 os.makedirs(DATASET_DIR, exist_ok=True)
 
 # Copy fold checkpoints
-ckpt_files = sorted(glob.glob(os.path.join(CKPT_DIR, "best_basic_f*.pt")))
+ckpt_files = sorted(glob.glob(os.path.join(CKPT_DIR, "best_bt_f*.pt")))
 if not ckpt_files:
     raise FileNotFoundError(f"No fold checkpoints found in {CKPT_DIR}. Run train.py first.")
 

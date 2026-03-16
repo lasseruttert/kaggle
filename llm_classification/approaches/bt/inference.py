@@ -1,10 +1,11 @@
 """
-inference_basic.py — Load fine-tuned RoBERTa fold checkpoints and produce submission.
+inference.py — Bradley-Terry RoBERTa inference.
+Loads calibrated fold bundles and produces submission.csv.
 Designed to run on Kaggle with no internet access.
 
 Expected Kaggle dataset layout:
-  /kaggle/input/llm-bert-basic-finetuned/
-      best_basic_f0.pt ... best_basic_f4.pt
+  /kaggle/input/llm-bert-bt-finetuned/
+      best_bt_f0.pt ... best_bt_fN.pt
       config.json
       tokenizer_config.json
       ...
@@ -27,13 +28,13 @@ from tqdm import tqdm
 # Config
 # ---------------------------------------------------------------------------
 KAGGLE       = os.path.exists("/kaggle")
-MODEL_DIR    = "/kaggle/input/llm-bert-basic-finetuned" if KAGGLE else "G:/My Drive/kaggle/llm_classification/kaggle_dataset/bert-finetuned"
+MODEL_DIR    = "/kaggle/input/llm-bert-bt-finetuned" if KAGGLE else "G:/My Drive/kaggle/llm_classification/kaggle_dataset/bt-finetuned"
 DATA_DIR     = "/kaggle/input/competitions/llm-classification-finetuning" if KAGGLE else "G:/My Drive/kaggle/llm_classification/llm-classification-finetuning"
 OUTPUT       = "/kaggle/working/submission.csv" if KAGGLE else "submission.csv"
 MAX_LEN      = 512
 BATCH_SIZE   = 16
-N_FEATURES   = 8
-CKPT_PATTERN = os.path.join(MODEL_DIR, "best_basic_f*.pt")
+PROMPT_BUDGET = 128
+CKPT_PATTERN = os.path.join(MODEL_DIR, "best_bt_f*.pt")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"CUDA available: {torch.cuda.is_available()}" + (f"  |  GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "  |  Running on CPU"))
@@ -63,99 +64,78 @@ def clean_text(s: str) -> str:
     return s.strip()
 
 
-def truncate_parts(tokenizer, prompt, resp_a, resp_b, max_len):
-    budget = max_len - 4
-    p_ids = tokenizer.encode(prompt, add_special_tokens=False)
-    a_ids = tokenizer.encode(resp_a,  add_special_tokens=False)
-    b_ids = tokenizer.encode(resp_b,  add_special_tokens=False)
-    total = len(p_ids) + len(a_ids) + len(b_ids)
-    if total > budget:
-        ratio = budget / total
-        p_ids = p_ids[:max(1, int(len(p_ids) * ratio))]
-        a_ids = a_ids[:max(1, int(len(a_ids) * ratio))]
-        b_ids = b_ids[:max(1, int(len(b_ids) * ratio))]
+def truncate_pair(tokenizer, prompt: str, response: str, max_len: int):
+    budget = max_len - 3
+    prompt_budget   = min(PROMPT_BUDGET, budget // 3)
+    response_budget = budget - prompt_budget
+    p_ids = tokenizer.encode(prompt,   add_special_tokens=False)[:prompt_budget]
+    r_ids = tokenizer.encode(response, add_special_tokens=False)[:response_budget]
     return (
         tokenizer.decode(p_ids, skip_special_tokens=True),
-        tokenizer.decode(a_ids, skip_special_tokens=True),
-        tokenizer.decode(b_ids, skip_special_tokens=True),
+        tokenizer.decode(r_ids, skip_special_tokens=True),
     )
 
 
-def build_hand_features(resp_a: str, resp_b: str) -> np.ndarray:
-    def word_count(t):   return len(t.split())
-    def sent_count(t):   return max(1, len(re.split(r"[.!?]+", t)))
-    def code_blocks(t):  return t.count("```")
-    def md_elements(t):  return len(re.findall(r"^#{1,6}\s|^[-*]\s|^\d+\.", t, re.M))
-    def avg_word_len(t): words = t.split(); return np.mean([len(w) for w in words]) if words else 0
-    def ttr(t):          words = t.lower().split(); return len(set(words)) / max(len(words), 1)
-
-    la, lb = len(resp_a), len(resp_b)
-    total  = la + lb + 1e-9
-    wa, wb = word_count(resp_a), word_count(resp_b)
-
-    return np.array([
-        la / total,
-        float(la > lb),
-        (wa - wb) / (wa + wb + 1e-9),
-        (sent_count(resp_a) - sent_count(resp_b)) / 10,
-        float(code_blocks(resp_a) > 0) - float(code_blocks(resp_b) > 0),
-        (md_elements(resp_a) - md_elements(resp_b)) / 5,
-        avg_word_len(resp_a) - avg_word_len(resp_b),
-        ttr(resp_a) - ttr(resp_b),
-    ], dtype=np.float32)
+def scores_to_probs(score_a, score_b, threshold: float, temp: float) -> np.ndarray:
+    diff    = score_a - score_b
+    raw_a   = 1.0 / (1.0 + np.exp(-(diff - threshold) / temp))
+    raw_b   = 1.0 / (1.0 + np.exp(-(-diff - threshold) / temp))
+    raw_tie = np.maximum(0.0, 1.0 - raw_a - raw_b)
+    total   = raw_a + raw_b + raw_tie + 1e-9
+    return np.stack([raw_a / total, raw_b / total, raw_tie / total], axis=1)
 
 
 # ---------------------------------------------------------------------------
-# Custom model (must match train.py exactly)
+# Model (must match train.py exactly)
 # ---------------------------------------------------------------------------
 
-class RobertaWithFeatures(nn.Module):
+class BTRewardModel(nn.Module):
     def __init__(self, model_dir: str):
         super().__init__()
         config = RobertaConfig.from_json_file(os.path.join(model_dir, "config.json"))
-        self.backbone = RobertaModel(config)
-        self.head = nn.Sequential(
-            nn.Linear(config.hidden_size + N_FEATURES, 256),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 3),
-        )
+        self.backbone   = RobertaModel(config)
+        self.score_head = nn.Linear(config.hidden_size, 1, bias=False)
 
-    def forward(self, input_ids, attention_mask, hand_features):
+    def score(self, input_ids, attention_mask):
         cls = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
-        logits = self.head(torch.cat([cls, hand_features], dim=-1))
-        return logits
+        return self.score_head(cls).squeeze(-1)
+
+    def forward(self, a_input_ids, a_attention_mask, b_input_ids, b_attention_mask):
+        score_a = self.score(a_input_ids, a_attention_mask)
+        score_b = self.score(b_input_ids, b_attention_mask)
+        return score_a, score_b
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset / Collator
 # ---------------------------------------------------------------------------
 
-class PreferenceDataset(Dataset):
+class BTDataset(Dataset):
     def __init__(self, df, tokenizer):
-        self.df = df.reset_index(drop=True)
+        self.df        = df.reset_index(drop=True)
         self.tokenizer = tokenizer
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, idx):
-        row = self.df.iloc[idx]
+        row        = self.df.iloc[idx]
         prompt     = clean_text(parse_prompt(row["prompt"]))
         resp_a_raw = clean_text(parse_prompt(row["response_a"]))
         resp_b_raw = clean_text(parse_prompt(row["response_b"]))
-        prompt, resp_a, resp_b = truncate_parts(self.tokenizer, prompt, resp_a_raw, resp_b_raw, MAX_LEN)
-        enc = self.tokenizer(
-            prompt,
-            f"Response A: {resp_a} Response B: {resp_b}",
-            max_length=MAX_LEN,
-            padding="max_length",
-            truncation=True,
-            return_tensors="pt",
-        )
-        item = {k: v.squeeze(0) for k, v in enc.items() if k != "token_type_ids"}
-        item["hand_features"] = torch.tensor(build_hand_features(resp_a_raw, resp_b_raw))
-        return item
+
+        p_a, r_a = truncate_pair(self.tokenizer, prompt, resp_a_raw, MAX_LEN)
+        p_b, r_b = truncate_pair(self.tokenizer, prompt, resp_b_raw, MAX_LEN)
+
+        enc_a = self.tokenizer(p_a, r_a, max_length=MAX_LEN, padding="max_length", truncation=True, return_tensors="pt")
+        enc_b = self.tokenizer(p_b, r_b, max_length=MAX_LEN, padding="max_length", truncation=True, return_tensors="pt")
+
+        return {
+            "a_input_ids":      enc_a["input_ids"].squeeze(0),
+            "a_attention_mask": enc_a["attention_mask"].squeeze(0),
+            "b_input_ids":      enc_b["input_ids"].squeeze(0),
+            "b_attention_mask": enc_b["attention_mask"].squeeze(0),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -163,20 +143,21 @@ class PreferenceDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def predict(model, loader, device):
+def predict_scores(model, loader, device):
     model.eval()
-    all_logits = []
+    all_sa, all_sb = [], []
     for batch in tqdm(loader, desc="Inference", leave=False):
         batch = {k: v.to(device) for k, v in batch.items()}
-        hand_features = batch.pop("hand_features")
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits = model(
-                input_ids=batch["input_ids"],
-                attention_mask=batch["attention_mask"],
-                hand_features=hand_features,
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else __import__("contextlib").nullcontext():
+            sa, sb = model(
+                a_input_ids=batch["a_input_ids"],
+                a_attention_mask=batch["a_attention_mask"],
+                b_input_ids=batch["b_input_ids"],
+                b_attention_mask=batch["b_attention_mask"],
             )
-        all_logits.append(logits.cpu().float())
-    return torch.cat(all_logits).softmax(-1).numpy()
+        all_sa.append(sa.cpu().float())
+        all_sb.append(sb.cpu().float())
+    return torch.cat(all_sa).numpy(), torch.cat(all_sb).numpy()
 
 
 def main():
@@ -187,7 +168,7 @@ def main():
         vocab_file=os.path.join(MODEL_DIR, "vocab.json"),
         merges_file=os.path.join(MODEL_DIR, "merges.txt"),
     )
-    loader    = DataLoader(PreferenceDataset(test_df, tokenizer), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    loader    = DataLoader(BTDataset(test_df, tokenizer), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     ckpt_paths = sorted(glob.glob(CKPT_PATTERN))
     if not ckpt_paths:
@@ -197,9 +178,15 @@ def main():
     all_preds = []
     for ckpt_path in ckpt_paths:
         print(f"Loading {os.path.basename(ckpt_path)} ...")
-        m = RobertaWithFeatures(MODEL_DIR).to(DEVICE)
-        m.load_state_dict(torch.load(ckpt_path, map_location=DEVICE))
-        all_preds.append(predict(m, loader, DEVICE))
+        bundle = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+        threshold   = bundle.get("threshold",   0.0)
+        temperature = bundle.get("temperature", 1.0)
+        print(f"  threshold={threshold:.4f}  temperature={temperature:.4f}")
+
+        m = BTRewardModel(MODEL_DIR).to(DEVICE)
+        m.load_state_dict(bundle["state_dict"])
+        sa, sb = predict_scores(m, loader, DEVICE)
+        all_preds.append(scores_to_probs(sa, sb, threshold, temperature))
         del m
         torch.cuda.empty_cache()
 

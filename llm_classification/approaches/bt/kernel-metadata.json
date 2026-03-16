@@ -1,6 +1,6 @@
 {
-  "id": "lasseruttert/reward-inference",
-  "title": "Reward Model Inference",
+  "id": "lasseruttert/bert-bt-inference",
+  "title": "BERT BT Inference",
   "code_file": "inference.py",
   "language": "python",
   "kernel_type": "script",
@@ -8,6 +8,6 @@
   "enable_gpu": true,
   "enable_internet": false,
   "competition_sources": ["llm-classification-finetuning"],
-  "dataset_sources": ["lasseruttert/llm-reward-finetuned"],
+  "dataset_sources": ["lasseruttert/llm-bert-bt-finetuned"],
   "kernel_sources": []
 }

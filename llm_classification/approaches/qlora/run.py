@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deploy stacked approach: train → save → upload dataset → push kernel → poll status.
+Deploy QLoRA approach: train → save → upload dataset → push kernel → poll status.
 
 Usage:
     python run.py [--skip-train] [--message "my message"]
@@ -14,8 +14,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DATASET_DIR = Path(__file__).parent.parent.parent / "kaggle_dataset" / "stacked-finetuned"
-KERNEL_ID   = "lasseruttert/stacked-inference"
+DATASET_DIR = Path(__file__).parent.parent.parent / "kaggle_dataset" / "qlora-finetuned"
+KERNEL_ID   = "lasseruttert/qlora-inference"
 SCRIPT_DIR  = Path(__file__).parent
 
 
@@ -39,7 +39,7 @@ def main() -> None:
     parser.add_argument("--skip-train", action="store_true")
     parser.add_argument(
         "--message",
-        default=f"auto deploy stacked {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        default=f"auto deploy qlora {datetime.now().strftime('%Y-%m-%d %H:%M')}",
     )
     args = parser.parse_args()
 

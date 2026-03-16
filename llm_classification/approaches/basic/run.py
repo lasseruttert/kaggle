@@ -58,9 +58,9 @@ def main() -> None:
         conda_check(["kaggle", "datasets", "create", "-p", str(DATASET_DIR)])
         new_dataset = True
 
-    if new_dataset:
-        header("Waiting 90s for new dataset to be indexed by Kaggle")
-        time.sleep(90)
+    wait_secs = 90 if new_dataset else 30
+    header(f"Waiting {wait_secs}s for dataset to be processed by Kaggle")
+    time.sleep(wait_secs)
 
     header("Pushing kernel")
     conda_check(["kaggle", "kernels", "push", "-p", str(SCRIPT_DIR)])
