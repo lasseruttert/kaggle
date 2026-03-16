@@ -1,0 +1,12 @@
+{
+  "id": "lasseruttert/llm-cls-inference",
+  "title": "LLM-CLS Inference",
+  "code_file": "inference.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "competition_sources": ["llm-classification-finetuning"],
+  "dataset_sources": ["lasseruttert/llm-llm-cls-finetuned"]
+}
