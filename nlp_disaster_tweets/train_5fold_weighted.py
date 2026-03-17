@@ -1,4 +1,5 @@
 import re
+import os
 import random
 import numpy as np
 import pandas as pd
@@ -27,7 +28,7 @@ def preprocess(text):
     return text
 
 # --- Config ---
-MODEL_NAME = "bert-base-uncased"
+MODEL_NAME = "roberta-base"
 MAX_LEN = 128
 BATCH_SIZE = 32
 EPOCHS = 3
@@ -72,6 +73,7 @@ texts_arr = np.array(texts)
 labels_arr = np.array(labels)
 
 # --- 5-Fold weighted ensemble ---
+os.makedirs("checkpoints", exist_ok=True)
 fold_results = []  # list of (val_f1, test_logits)
 
 skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=SEED)
@@ -100,7 +102,8 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(texts_arr, labels_arr)):
     total_steps = len(train_loader) * EPOCHS
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=total_steps // 10, num_training_steps=total_steps)
 
-    val_f1 = 0.0
+    best_val_f1 = 0.0
+    ckpt_path = f"checkpoints/fold_{fold+1}_best.pt"
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
@@ -132,8 +135,12 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(texts_arr, labels_arr)):
 
         val_f1 = f1_score(all_labels_val, all_preds)
         print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), ckpt_path)
 
     # Collect test logits for this fold
+    model.load_state_dict(torch.load(ckpt_path))
     model.eval()
     fold_logits = []
     with torch.no_grad():
@@ -142,7 +149,7 @@ for fold, (train_idx, val_idx) in enumerate(skf.split(texts_arr, labels_arr)):
             attention_mask = test_encodings["attention_mask"][i:i+BATCH_SIZE].to(DEVICE)
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
             fold_logits.append(logits.cpu())
-    fold_results.append((val_f1, torch.cat(fold_logits, dim=0)))
+    fold_results.append((best_val_f1, torch.cat(fold_logits, dim=0)))
 
 # --- Weighted ensemble ---
 print("\n--- Fold Results ---")

@@ -1,4 +1,5 @@
 import re
+import os
 import random
 import numpy as np
 import pandas as pd
@@ -28,11 +29,11 @@ def preprocess(text):
     return text
 
 # --- Config ---
-MODEL_NAME = "bert-base-uncased"
+MODEL_NAME = "roberta-base"
 MAX_LEN = 128
 BATCH_SIZE = 32
-EPOCHS = 3
-LR = 2e-5
+EPOCHS = 2
+LR = 3e-5
 SEEDS = [42, 43, 44]  # one full train run per seed
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -69,6 +70,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 test_encodings = tokenizer(test_texts, truncation=True, padding="max_length", max_length=MAX_LEN, return_tensors="pt")
 
 # --- Ensemble loop ---
+os.makedirs("checkpoints", exist_ok=True)
 all_test_logits = []
 
 for seed in SEEDS:
@@ -95,6 +97,8 @@ for seed in SEEDS:
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=total_steps // 10, num_training_steps=total_steps)
 
     # Train
+    best_val_f1 = 0.0
+    ckpt_path = f"checkpoints/seed_{seed}_best.pt"
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
@@ -127,8 +131,12 @@ for seed in SEEDS:
 
         val_f1 = f1_score(all_labels, all_preds)
         print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), ckpt_path)
 
     # Collect test logits for this seed
+    model.load_state_dict(torch.load(ckpt_path))
     model.eval()
     seed_logits = []
     with torch.no_grad():

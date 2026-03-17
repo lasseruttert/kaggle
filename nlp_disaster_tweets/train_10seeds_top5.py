@@ -1,4 +1,5 @@
 import re
+import os
 import random
 import numpy as np
 import pandas as pd
@@ -27,7 +28,7 @@ def preprocess(text):
     return text
 
 # --- Config ---
-MODEL_NAME = "bert-base-uncased"
+MODEL_NAME = "roberta-base"
 MAX_LEN = 128
 BATCH_SIZE = 32
 EPOCHS = 6
@@ -69,6 +70,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 test_encodings = tokenizer(test_texts, truncation=True, padding="max_length", max_length=MAX_LEN, return_tensors="pt")
 
 # --- 10-seed loop ---
+os.makedirs("checkpoints", exist_ok=True)
 seed_results = []  # list of (seed, val_f1, test_logits)
 
 for seed in SEEDS:
@@ -94,7 +96,8 @@ for seed in SEEDS:
     total_steps = len(train_loader) * EPOCHS
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=total_steps // 10, num_training_steps=total_steps)
 
-    val_f1 = 0.0
+    best_val_f1 = 0.0
+    ckpt_path = f"checkpoints/seed_{seed}_best.pt"
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
@@ -126,8 +129,12 @@ for seed in SEEDS:
 
         val_f1 = f1_score(all_labels_val, all_preds)
         print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val F1: {val_f1:.4f}")
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), ckpt_path)
 
     # Collect test logits
+    model.load_state_dict(torch.load(ckpt_path))
     model.eval()
     seed_logits = []
     with torch.no_grad():
@@ -136,7 +143,7 @@ for seed in SEEDS:
             attention_mask = test_encodings["attention_mask"][i:i+BATCH_SIZE].to(DEVICE)
             logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
             seed_logits.append(logits.cpu())
-    seed_results.append((seed, val_f1, torch.cat(seed_logits, dim=0)))
+    seed_results.append((seed, best_val_f1, torch.cat(seed_logits, dim=0)))
 
 # --- Select top 5 ---
 ranked = sorted(seed_results, key=lambda x: x[1], reverse=True)
