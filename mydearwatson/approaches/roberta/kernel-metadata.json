@@ -1,0 +1,13 @@
+{
+  "id": "lasseruttert/watson-roberta-inference",
+  "title": "Watson RoBERTa Inference",
+  "code_file": "inference.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "competition_sources": ["contradictory-my-dear-watson"],
+  "dataset_sources": ["lasseruttert/watson-roberta-finetuned"],
+  "kernel_sources": []
+}
