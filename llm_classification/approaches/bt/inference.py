@@ -1,11 +1,11 @@
 """
-inference.py — Bradley-Terry RoBERTa inference.
-Loads calibrated fold bundles and produces submission.csv.
+inference.py — Davidson Bradley-Terry RoBERTa inference.
+Loads seed checkpoints and produces submission.csv.
 Designed to run on Kaggle with no internet access.
 
 Expected Kaggle dataset layout:
   /kaggle/input/llm-bert-bt-finetuned/
-      best_bt_f0.pt ... best_bt_fN.pt
+      best_bt_s*.pt
       config.json
       tokenizer_config.json
       ...
@@ -19,6 +19,7 @@ import unicodedata
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import RobertaTokenizer, RobertaModel, RobertaConfig
@@ -34,7 +35,7 @@ OUTPUT       = "/kaggle/working/submission.csv" if KAGGLE else "submission.csv"
 MAX_LEN      = 512
 BATCH_SIZE   = 16
 PROMPT_BUDGET = 128
-CKPT_PATTERN = os.path.join(MODEL_DIR, "best_bt_f*.pt")
+CKPT_PATTERN = os.path.join(MODEL_DIR, "best_bt_s*.pt")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"CUDA available: {torch.cuda.is_available()}" + (f"  |  GPU: {torch.cuda.get_device_name(0)}" if torch.cuda.is_available() else "  |  Running on CPU"))
@@ -64,25 +65,18 @@ def clean_text(s: str) -> str:
     return s.strip()
 
 
-def truncate_pair(tokenizer, prompt: str, response: str, max_len: int):
+def encode_pair(tokenizer, prompt: str, response: str, max_len: int) -> dict:
     budget = max_len - 3
     prompt_budget   = min(PROMPT_BUDGET, budget // 3)
     response_budget = budget - prompt_budget
     p_ids = tokenizer.encode(prompt,   add_special_tokens=False)[:prompt_budget]
     r_ids = tokenizer.encode(response, add_special_tokens=False)[:response_budget]
-    return (
-        tokenizer.decode(p_ids, skip_special_tokens=True),
-        tokenizer.decode(r_ids, skip_special_tokens=True),
-    )
-
-
-def scores_to_probs(score_a, score_b, threshold: float, temp: float) -> np.ndarray:
-    diff    = score_a - score_b
-    raw_a   = 1.0 / (1.0 + np.exp(-(diff - threshold) / temp))
-    raw_b   = 1.0 / (1.0 + np.exp(-(-diff - threshold) / temp))
-    raw_tie = np.maximum(0.0, 1.0 - raw_a - raw_b)
-    total   = raw_a + raw_b + raw_tie + 1e-9
-    return np.stack([raw_a / total, raw_b / total, raw_tie / total], axis=1)
+    input_ids = [tokenizer.cls_token_id] + p_ids + [tokenizer.sep_token_id] + r_ids + [tokenizer.sep_token_id]
+    attention_mask = [1] * len(input_ids)
+    return {
+        "input_ids":      torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -90,52 +84,74 @@ def scores_to_probs(score_a, score_b, threshold: float, temp: float) -> np.ndarr
 # ---------------------------------------------------------------------------
 
 class BTRewardModel(nn.Module):
+    DROPOUT = 0.1
+
     def __init__(self, model_dir: str):
         super().__init__()
         config = RobertaConfig.from_json_file(os.path.join(model_dir, "config.json"))
         self.backbone   = RobertaModel(config)
+        self.dropout    = nn.Dropout(self.DROPOUT)
         self.score_head = nn.Linear(config.hidden_size, 1, bias=False)
+        self.tie_head   = nn.Sequential(
+            nn.Linear(config.hidden_size, 128),
+            nn.GELU(),
+            nn.Dropout(self.DROPOUT),
+            nn.Linear(128, 1),
+        )
 
-    def score(self, input_ids, attention_mask):
+    def _encode(self, input_ids, attention_mask):
         cls = self.backbone(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0]
-        return self.score_head(cls).squeeze(-1)
+        return self.dropout(cls)
 
     def forward(self, a_input_ids, a_attention_mask, b_input_ids, b_attention_mask):
-        score_a = self.score(a_input_ids, a_attention_mask)
-        score_b = self.score(b_input_ids, b_attention_mask)
-        return score_a, score_b
+        cls_a = self._encode(a_input_ids, a_attention_mask)
+        cls_b = self._encode(b_input_ids, b_attention_mask)
+        score_a = self.score_head(cls_a).squeeze(-1)
+        score_b = self.score_head(cls_b).squeeze(-1)
+        tie_logit = self.tie_head(torch.abs(cls_a - cls_b)).squeeze(-1)
+        logits = torch.stack([
+            score_a - score_b,
+            score_b - score_a,
+            tie_logit,
+        ], dim=1)
+        return logits
 
 
 # ---------------------------------------------------------------------------
 # Dataset / Collator
 # ---------------------------------------------------------------------------
 
-class BTDataset(Dataset):
-    def __init__(self, df, tokenizer):
-        self.df        = df.reset_index(drop=True)
-        self.tokenizer = tokenizer
+class BTCollator:
+    def __init__(self, tokenizer):
+        self._pad_id = tokenizer.pad_token_id
 
-    def __len__(self):
-        return len(self.df)
+    def __call__(self, features):
+        def pad_group(key_ids, key_mask):
+            seqs = [f[key_ids] for f in features]
+            masks = [f[key_mask] for f in features]
+            max_len = max(s.size(0) for s in seqs)
+            padded_ids  = torch.full((len(seqs), max_len), self._pad_id, dtype=torch.long)
+            padded_mask = torch.zeros((len(seqs), max_len), dtype=torch.long)
+            for i, (s, m) in enumerate(zip(seqs, masks)):
+                padded_ids[i, :s.size(0)]  = s
+                padded_mask[i, :m.size(0)] = m
+            return padded_ids, padded_mask
 
-    def __getitem__(self, idx):
-        row        = self.df.iloc[idx]
-        prompt     = clean_text(parse_prompt(row["prompt"]))
-        resp_a_raw = clean_text(parse_prompt(row["response_a"]))
-        resp_b_raw = clean_text(parse_prompt(row["response_b"]))
-
-        p_a, r_a = truncate_pair(self.tokenizer, prompt, resp_a_raw, MAX_LEN)
-        p_b, r_b = truncate_pair(self.tokenizer, prompt, resp_b_raw, MAX_LEN)
-
-        enc_a = self.tokenizer(p_a, r_a, max_length=MAX_LEN, padding="max_length", truncation=True, return_tensors="pt")
-        enc_b = self.tokenizer(p_b, r_b, max_length=MAX_LEN, padding="max_length", truncation=True, return_tensors="pt")
-
+        a_ids, a_mask = pad_group("a_input_ids", "a_attention_mask")
+        b_ids, b_mask = pad_group("b_input_ids", "b_attention_mask")
         return {
-            "a_input_ids":      enc_a["input_ids"].squeeze(0),
-            "a_attention_mask": enc_a["attention_mask"].squeeze(0),
-            "b_input_ids":      enc_b["input_ids"].squeeze(0),
-            "b_attention_mask": enc_b["attention_mask"].squeeze(0),
+            "a_input_ids": a_ids, "a_attention_mask": a_mask,
+            "b_input_ids": b_ids, "b_attention_mask": b_mask,
         }
+
+
+class BTDataset(Dataset):
+    def __init__(self, records):
+        self.records = records
+    def __len__(self):
+        return len(self.records)
+    def __getitem__(self, idx):
+        return dict(self.records[idx])
 
 
 # ---------------------------------------------------------------------------
@@ -143,50 +159,59 @@ class BTDataset(Dataset):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def predict_scores(model, loader, device):
+def predict_probs(model, loader, device):
     model.eval()
-    all_sa, all_sb = [], []
+    all_logits = []
     for batch in tqdm(loader, desc="Inference", leave=False):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.type == "cuda" else __import__("contextlib").nullcontext():
-            sa, sb = model(
+            logits = model(
                 a_input_ids=batch["a_input_ids"],
                 a_attention_mask=batch["a_attention_mask"],
                 b_input_ids=batch["b_input_ids"],
                 b_attention_mask=batch["b_attention_mask"],
             )
-        all_sa.append(sa.cpu().float())
-        all_sb.append(sb.cpu().float())
-    return torch.cat(all_sa).numpy(), torch.cat(all_sb).numpy()
+        all_logits.append(logits.cpu().float())
+    return F.softmax(torch.cat(all_logits), dim=1).numpy()
 
 
 def main():
-    test_df   = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
+    test_df = pd.read_csv(os.path.join(DATA_DIR, "test.csv"))
     print(f"Test rows: {len(test_df)}")
 
     tokenizer = RobertaTokenizer(
         vocab_file=os.path.join(MODEL_DIR, "vocab.json"),
         merges_file=os.path.join(MODEL_DIR, "merges.txt"),
     )
-    loader    = DataLoader(BTDataset(test_df, tokenizer), batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    collator = BTCollator(tokenizer)
+
+    # Pre-tokenize test
+    records = []
+    prompts     = test_df["prompt"].apply(lambda s: clean_text(parse_prompt(s))).tolist()
+    responses_a = test_df["response_a"].apply(lambda s: clean_text(parse_prompt(s))).tolist()
+    responses_b = test_df["response_b"].apply(lambda s: clean_text(parse_prompt(s))).tolist()
+    for i in tqdm(range(len(test_df)), desc="Tokenizing"):
+        enc_a = encode_pair(tokenizer, prompts[i], responses_a[i], MAX_LEN)
+        enc_b = encode_pair(tokenizer, prompts[i], responses_b[i], MAX_LEN)
+        records.append({
+            "a_input_ids": enc_a["input_ids"], "a_attention_mask": enc_a["attention_mask"],
+            "b_input_ids": enc_b["input_ids"], "b_attention_mask": enc_b["attention_mask"],
+        })
+
+    loader = DataLoader(BTDataset(records), batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator)
 
     ckpt_paths = sorted(glob.glob(CKPT_PATTERN))
     if not ckpt_paths:
-        raise FileNotFoundError(f"No fold checkpoints found at {CKPT_PATTERN}")
-    print(f"Found {len(ckpt_paths)} fold checkpoint(s): {[os.path.basename(p) for p in ckpt_paths]}")
+        raise FileNotFoundError(f"No seed checkpoints found at {CKPT_PATTERN}")
+    print(f"Found {len(ckpt_paths)} seed checkpoint(s): {[os.path.basename(p) for p in ckpt_paths]}")
 
     all_preds = []
     for ckpt_path in ckpt_paths:
         print(f"Loading {os.path.basename(ckpt_path)} ...")
         bundle = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-        threshold   = bundle.get("threshold",   0.0)
-        temperature = bundle.get("temperature", 1.0)
-        print(f"  threshold={threshold:.4f}  temperature={temperature:.4f}")
-
         m = BTRewardModel(MODEL_DIR).to(DEVICE)
         m.load_state_dict(bundle["state_dict"])
-        sa, sb = predict_scores(m, loader, DEVICE)
-        all_preds.append(scores_to_probs(sa, sb, threshold, temperature))
+        all_preds.append(predict_probs(m, loader, DEVICE))
         del m
         torch.cuda.empty_cache()
 

@@ -3,6 +3,7 @@ save.py — Copy BT fold checkpoints + tokenizer/config to kaggle_dataset.
 Run from approaches/bt/ or anywhere; paths are relative to this file.
 """
 import glob
+import json
 import os
 import shutil
 from transformers import RobertaTokenizer, AutoConfig
@@ -16,7 +17,7 @@ BASE_MODEL  = "roberta-base"
 os.makedirs(DATASET_DIR, exist_ok=True)
 
 # Copy fold checkpoints
-ckpt_files = sorted(glob.glob(os.path.join(CKPT_DIR, "best_bt_f*.pt")))
+ckpt_files = sorted(glob.glob(os.path.join(CKPT_DIR, "best_bt_s*.pt")))
 if not ckpt_files:
     raise FileNotFoundError(f"No fold checkpoints found in {CKPT_DIR}. Run train.py first.")
 
@@ -29,4 +30,16 @@ for src in ckpt_files:
 RobertaTokenizer.from_pretrained(BASE_MODEL).save_pretrained(DATASET_DIR)
 AutoConfig.from_pretrained(BASE_MODEL).save_pretrained(DATASET_DIR)
 print(f"Tokenizer + config saved to {DATASET_DIR}")
+
+# Write dataset-metadata.json for kaggle datasets create/version
+metadata = {
+    "title": "LLM BT Fine-tuned",
+    "id": "lasseruttert/llm-bert-bt-finetuned",
+    "licenses": [{"name": "CC0-1.0"}],
+}
+meta_path = os.path.join(DATASET_DIR, "dataset-metadata.json")
+with open(meta_path, "w") as f:
+    json.dump(metadata, f, indent=2)
+print(f"dataset-metadata.json written to {meta_path}")
+
 print("Done.")
