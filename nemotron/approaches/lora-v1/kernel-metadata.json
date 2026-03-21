@@ -1,0 +1,14 @@
+{
+  "id": "lasseruttert/nemotron-lora-v1",
+  "title": "Nemotron LoRA v1",
+  "code_file": "train.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": false,
+  "competition_sources": ["nvidia-nemotron-model-reasoning-challenge"],
+  "dataset_sources": ["lasseruttert/nemotron-training-data"],
+  "model_sources": ["metric/nemotron-3-nano-30b-a3b-bf16/transformers/default/1"],
+  "kernel_sources": ["ryanholbrook/nvidia-utility-script"]
+}
